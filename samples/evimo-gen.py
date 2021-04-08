@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+from concurrent import futures
 import numpy as np
 import matplotlib.pyplot as plt
 import os, sys, math, signal, glob
@@ -161,6 +162,148 @@ def save_plot(frames_meta, oids, file_name, tp='pos'):
     plt.savefig(file_name, dpi=400, bbox_inches='tight')
     #plt.show()
 
+
+def data_creator(sequence: str):
+
+    print(f"{pydvs.okb('STARTING DATASET CREATION')} for sequence: {sequence}")
+    dataset_txt = eval(open(os.path.join(sequence, 'meta.txt')).read())
+
+    K = np.array([[0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0]])
+    D = np.array([0.0, 0.0, 0.0, 0.0])
+
+    K[0][0] = dataset_txt['meta']['fx']
+    K[1][1] = dataset_txt['meta']['fy']
+    K[0][2] = dataset_txt['meta']['cx']
+    K[1][2] = dataset_txt['meta']['cy']
+    D[0] = dataset_txt['meta']['k1']
+    D[1] = dataset_txt['meta']['k2']
+    D[2] = dataset_txt['meta']['k3']
+    D[3] = dataset_txt['meta']['k4']
+    RES_X = dataset_txt['meta']['res_x']
+    RES_Y = dataset_txt['meta']['res_y']
+    NUM_FRAMES = len(dataset_txt['frames'])
+    frames_meta = dataset_txt['frames']
+    
+    oids = []
+    for key in frames_meta[0]:
+        if (key == 'cam'): continue
+        if (type(frames_meta[0][key]) == type(dict()) and 'pos' in frames_meta[0][key]):
+            oids.append(key)
+
+    print (pydvs.okb("Resolution:"), RES_X, 'x', RES_Y)
+    print (pydvs.okb("Frames:"), NUM_FRAMES)
+    print (pydvs.okb("Object ids:"), oids)
+    print (pydvs.okb("Calibration:"))
+    print (K)
+    print (D)
+
+    # Create a plot
+    #save_plot(frames_meta, oids, os.path.join(args.base_dir, 'position_plots.pdf'), tp='pos')
+    #save_plot(dataset_txt['full_trajectory'], oids, os.path.join(args.base_dir, 'position_plots.pdf'), tp='pos')
+
+    # Read depth / masks
+    print (pydvs.bld("Reading the depth and masks:"))
+    depths    = np.zeros((NUM_FRAMES,) + (RES_X, RES_Y), dtype=np.uint16)
+    masks     = np.zeros((NUM_FRAMES,) + (RES_X, RES_Y), dtype=np.uint16)
+    classical = np.zeros((NUM_FRAMES,) + (RES_X, RES_Y, 3), dtype=np.uint8)
+    classical_read = 0
+    for i, frame in enumerate(frames_meta):
+        print("frame\t", i + 1, "/", NUM_FRAMES, "\t", end='\r')
+
+        gt_frame_name = os.path.join(sequence, f"img/{frame['gt_frame']}")
+        gt_img = cv2.imread(gt_frame_name, cv2.IMREAD_UNCHANGED)
+        
+        if (gt_img.dtype != depths.dtype or gt_img.dtype != masks.dtype):
+            print ("\tType mismatch! Expected", depths.dtype, " but have", gt_img.dtype)
+            sys.exit(-1)
+
+        depths[i,:,:] = gt_img[:,:,0] # depth is in mm
+        masks[i,:,:]  = gt_img[:,:,2] # mask is object ids * 1000
+
+        if ('classical_frame' in frame.keys()):
+            classical_frame_name = os.path.join(sequence, f"img/{frame['classical_frame']}")
+            classical_img = cv2.imread(classical_frame_name, cv2.IMREAD_UNCHANGED)
+            classical[i,:,:,:] = classical_img
+            if (gt_img.dtype != depths.dtype or gt_img.dtype != masks.dtype):
+                print ("\tType mismatch! Expected", classical.dtype, " but have", classical_img.dtype)
+                sys.exit(-1)
+            classical_read += 1
+    print ("\n")
+
+    if (classical_read > 0):
+        print (pydvs.okb("Read "), classical_read, "/", NUM_FRAMES, pydvs.okb(" classical frames"))
+    else:
+        classical = None
+
+    # Read event cloud
+    cloud, idx = pydvs.read_event_file_txt(os.path.join(sequence, 'events.txt'), args.discretization)
+    tmin = frames_meta[0]['ts']
+    tmax = frames_meta[-1]['ts']
+    if (cloud.shape[0] > 0):
+        tmin = cloud[0][0]
+        tmax = cloud[-1][0]
+    print (pydvs.okb("The recording range:"), tmin, "-", tmax)
+    print (pydvs.okb("The gt range:"), frames_meta[0]['ts'], "-", frames_meta[-1]['ts'])
+    print (pydvs.okb("Discretization resolution:"), args.discretization)
+
+    """
+    # Save .npz file
+    print (pydvs.bld("Saving..."))
+    np.savez_compressed(os.path.join(args.base_dir, 'dataset.npz'), events=cloud, index=idx, classical=classical,
+        discretization=args.discretization, K=K, D=D, depth=depths, mask=masks, meta=dataset_txt)
+    print ("\n")
+    """
+
+    # Generate images:
+    slice_dir = os.path.join(sequence, 'slices')
+    #vis_dir   = os.path.join(args.base_dir, 'vis')
+
+    pydvs.replace_dir(slice_dir)
+    #pydvs.replace_dir(vis_dir)
+    for i, frame in enumerate(frames_meta):
+        print ("Saving sanity check frames\t", i + 1, "/", NUM_FRAMES, "\t", end='\r')
+        time = frame['ts']
+        if (time > tmax or time < tmin):
+            continue
+
+        cv2.imwrite(os.path.join(slice_dir, 'mask_'  + str(i).rjust(10, '0') + '.png'), masks[i].astype(np.uint16))
+        
+        if (cloud.shape[0] > 0):
+            sl, _ = pydvs.get_slice(cloud, idx, time, args.slice_width, 1, args.discretization)
+            eimg = dvs_img(sl, (RES_X, RES_Y), None, None, args.slice_width, mode=1)
+            cv2.imwrite(os.path.join(slice_dir, 'frame_' + str(i).rjust(10, '0') + '.png'), eimg)
+
+        depth = depths[i].astype(np.float)
+        mask  = masks[i].astype(np.float)
+        col_mask = mask_to_color(mask)
+
+        """
+        # normalize for visualization
+        mask = (255 * (mask.astype(np.float) - np.nanmin(mask)) / (np.nanmax(mask) - np.nanmin(mask))).astype(np.uint8)
+        depth = (255 * (depth.astype(np.float) - np.nanmin(depth)) / (np.nanmax(depth) - np.nanmin(depth))).astype(np.uint8)
+
+        if ((classical_read > 0) and (classical is not None)):
+            grayscale_img = cv2.cvtColor(classical[i], cv2.COLOR_BGR2GRAY).astype(np.float)
+            rgb_img = np.dstack((grayscale_img, grayscale_img, grayscale_img))
+            rgb_img[mask > 0] = rgb_img[mask > 0] * 0.2 + col_mask[mask > 0] * 0.8
+            #rgb_img = np.rot90(rgb_img, k=2)
+            #depth = np.rot90(depth, k=2)
+            eimg = np.hstack((rgb_img.astype(np.uint8), np.dstack((depth,depth,depth))))
+        else:
+            eimg = dvs_img(sl, (RES_X, RES_Y), None, None, args.slice_width, mode=0)
+            eimg[mask > 0] = eimg[mask > 0] * 0.5 + col_mask[mask > 0] * 0.5
+            eimg = np.hstack((eimg.astype(np.uint8), np.dstack((depth,depth,depth))))
+
+        #footer = gen_text_stub(eimg.shape[1], frame)
+        #eimg = np.vstack((eimg, footer))
+
+        cv2.imwrite(os.path.join(vis_dir, 'frame_' + str(i).rjust(10, '0') + '.png'), eimg)
+        """
+    print(F"{pydvs.okg('FINISHED DATASET CREATION')} for sequence {sequence}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_dir',
@@ -178,136 +321,27 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     print (pydvs.okb("Opening"), args.base_dir)
-
-    dataset_txt = eval(open(os.path.join(args.base_dir, 'meta.txt')).read())
-
-    K = np.array([[0.0, 0.0, 0.0],
-                  [0.0, 0.0, 0.0],
-                  [0.0, 0.0, 1.0]])
-    D = np.array([0.0, 0.0, 0.0, 0.0])
-
-    K[0][0] = dataset_txt['meta']['fx']
-    K[1][1] = dataset_txt['meta']['fy']
-    K[0][2] = dataset_txt['meta']['cx']
-    K[1][2] = dataset_txt['meta']['cy']
-    D[0] = dataset_txt['meta']['k1']
-    D[1] = dataset_txt['meta']['k2']
-    D[2] = dataset_txt['meta']['k3']
-    D[3] = dataset_txt['meta']['k4']
-    RES_X = dataset_txt['meta']['res_x']
-    RES_Y = dataset_txt['meta']['res_y']
-    NUM_FRAMES = len(dataset_txt['frames'])
-    frames_meta = dataset_txt['frames']
-
-    oids = []
-    for key in frames_meta[0]:
-        if (key == 'cam'): continue
-        if (type(frames_meta[0][key]) == type(dict()) and 'pos' in frames_meta[0][key]):
-            oids.append(key)
-
-    print (pydvs.okb("Resolution:"), RES_X, 'x', RES_Y)
-    print (pydvs.okb("Frames:"), NUM_FRAMES)
-    print (pydvs.okb("Object ids:"), oids)
-    print (pydvs.okb("Calibration:"))
-    print (K)
-    print (D)
-
-    # Create a plot
-    #save_plot(frames_meta, oids, os.path.join(args.base_dir, 'position_plots.pdf'), tp='pos')
-    save_plot(dataset_txt['full_trajectory'], oids, os.path.join(args.base_dir, 'position_plots.pdf'), tp='pos')
-
-    # Read depth / masks
-    print (pydvs.bld("Reading the depth and masks:"))
-    depths    = np.zeros((NUM_FRAMES,) + (RES_Y, RES_X), dtype=np.uint16)
-    masks     = np.zeros((NUM_FRAMES,) + (RES_Y, RES_X), dtype=np.uint16)
-    classical = np.zeros((NUM_FRAMES,) + (RES_Y, RES_X, 3), dtype=np.uint8)
-    classical_read = 0
-    for i, frame in enumerate(frames_meta):
-        print ("frame\t", i + 1, "/", NUM_FRAMES, "\t", end='\r')
-
-        gt_frame_name = os.path.join(args.base_dir, frame['gt_frame'])
-        gt_img = cv2.imread(gt_frame_name, cv2.IMREAD_UNCHANGED)
-        if (gt_img.dtype != depths.dtype or gt_img.dtype != masks.dtype):
-            print ("\tType mismatch! Expected", depths.dtype, " but have", gt_img.dtype)
-            sys.exit(-1)
-
-        depths[i,:,:] = gt_img[:,:,0] # depth is in mm
-        masks[i,:,:]  = gt_img[:,:,2] # mask is object ids * 1000
-
-        if ('classical_frame' in frame.keys()):
-            classical_frame_name = os.path.join(args.base_dir, frame['classical_frame'])
-            classical_img = cv2.imread(classical_frame_name, cv2.IMREAD_UNCHANGED)
-            classical[i,:,:,:] = classical_img
-            if (gt_img.dtype != depths.dtype or gt_img.dtype != masks.dtype):
-                print ("\tType mismatch! Expected", classical.dtype, " but have", classical_img.dtype)
-                sys.exit(-1)
-            classical_read += 1
-    print ("\n")
-
-    if (classical_read > 0):
-        print (pydvs.okb("Read "), classical_read, "/", NUM_FRAMES, pydvs.okb(" classical frames"))
-    else:
-        classical = None
-
-    # Read event cloud
-    cloud, idx = pydvs.read_event_file_txt(os.path.join(args.base_dir, 'events.txt'), args.discretization)
-    tmin = frames_meta[0]['ts']
-    tmax = frames_meta[-1]['ts']
-    if (cloud.shape[0] > 0):
-        tmin = cloud[0][0]
-        tmax = cloud[-1][0]
-    print (pydvs.okb("The recording range:"), tmin, "-", tmax)
-    print (pydvs.okb("The gt range:"), frames_meta[0]['ts'], "-", frames_meta[-1]['ts'])
-    print (pydvs.okb("Discretization resolution:"), args.discretization)
-
-    # Save .npz file
-    print (pydvs.bld("Saving..."))
-    np.savez_compressed(os.path.join(args.base_dir, 'dataset.npz'), events=cloud, index=idx, classical=classical,
-        discretization=args.discretization, K=K, D=D, depth=depths, mask=masks, meta=dataset_txt)
-    print ("\n")
-
-    # Generate images:
-    slice_dir = os.path.join(args.base_dir, 'slices')
-    vis_dir   = os.path.join(args.base_dir, 'vis')
-
-    pydvs.replace_dir(slice_dir)
-    pydvs.replace_dir(vis_dir)
-    for i, frame in enumerate(frames_meta):
-        print ("Saving sanity check frames\t", i + 1, "/", NUM_FRAMES, "\t", end='\r')
-        time = frame['ts']
-        if (time > tmax or time < tmin):
+    
+    for background_folder in os.listdir(args.base_dir):
+        background_folder = os.path.join(args.base_dir, background_folder, 'txt')
+        if not os.path.isdir(background_folder):
             continue
+        
+        ex = futures.ProcessPoolExecutor(max_workers=2)
+        
+        sequences = [
+            os.path.join(background_folder, s)
+            for s in os.listdir(background_folder) 
+            if os.path.isdir(os.path.join(background_folder, s))]
+        #for s in sequences:
+        #    data_creator(s)
+        
+        wait_for = [
+            ex.submit(data_creator, s)
+            for s in sequences]
+        for f in futures.as_completed(wait_for):
+            pass
+            
+            
 
-        cv2.imwrite(os.path.join(slice_dir, 'depth_' + str(i).rjust(10, '0') + '.png'), depths[i].astype(np.uint16))
-        cv2.imwrite(os.path.join(slice_dir, 'mask_'  + str(i).rjust(10, '0') + '.png'), masks[i].astype(np.uint16))
 
-        if (cloud.shape[0] > 0):
-            sl, _ = pydvs.get_slice(cloud, idx, time, args.slice_width, 1, args.discretization)
-            eimg = dvs_img(sl, (RES_Y, RES_X), None, None, args.slice_width, mode=0)
-            cv2.imwrite(os.path.join(slice_dir, 'frame_' + str(i).rjust(10, '0') + '.png'), eimg)
-
-        depth = depths[i].astype(np.float)
-        mask  = masks[i].astype(np.float)
-        col_mask = mask_to_color(mask)
-
-        # normalize for visualization
-        mask = (255 * (mask.astype(np.float) - np.nanmin(mask)) / (np.nanmax(mask) - np.nanmin(mask))).astype(np.uint8)
-        depth = (255 * (depth.astype(np.float) - np.nanmin(depth)) / (np.nanmax(depth) - np.nanmin(depth))).astype(np.uint8)
-
-        if ((classical_read > 0) and (classical is not None)):
-            grayscale_img = cv2.cvtColor(classical[i], cv2.COLOR_BGR2GRAY).astype(np.float)
-            rgb_img = np.dstack((grayscale_img, grayscale_img, grayscale_img))
-            rgb_img[mask > 0] = rgb_img[mask > 0] * 0.2 + col_mask[mask > 0] * 0.8
-            rgb_img = np.rot90(rgb_img, k=2)
-            depth = np.rot90(depth, k=2)
-            eimg = np.hstack((rgb_img.astype(np.uint8), np.dstack((depth,depth,depth))))
-        else:
-            eimg = dvs_img(sl, (RES_Y, RES_X), None, None, args.slice_width, mode=0)
-            eimg[mask > 0] = eimg[mask > 0] * 0.5 + col_mask[mask > 0] * 0.5
-            eimg = np.hstack((eimg.astype(np.uint8), np.dstack((depth,depth,depth))))
-
-        #footer = gen_text_stub(eimg.shape[1], frame)
-        #eimg = np.vstack((eimg, footer))
-
-        cv2.imwrite(os.path.join(vis_dir, 'frame_' + str(i).rjust(10, '0') + '.png'), eimg)
-    print (pydvs.okg("\nDone.\n"))

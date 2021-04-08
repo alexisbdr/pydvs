@@ -136,7 +136,6 @@ def get_index(cloud, index_w):
             idx.append(i)
             last_ts += index_w
 
-    print ()
     idx.append(cloud.shape[0] - 1)
     return np.array(idx, dtype=np.uint32)
 
@@ -159,6 +158,7 @@ def read_event_file_txt(fname, discretization, sort=False):
     print (okg("Read"), cloud.shape[0], okg("events:"), cloud[0][0], "-", cloud[-1][0], "sec.")
 
     idx = get_index(cloud, discretization)
+    print(idx)
     return cloud.astype(np.float32), idx
 
 
